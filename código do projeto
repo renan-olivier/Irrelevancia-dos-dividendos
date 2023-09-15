@@ -1,0 +1,936 @@
+############Pesquisa PIBIC Teoria da Irrelevância dos Dividendos#####################
+library(tidyverse) 
+library(lubridate)
+library(quantmod)
+library(xts)
+library(PerformanceAnalytics)
+library(dplyr)
+library(tseries)
+library(tidyquant)
+library(httr)
+library(jsonlite)
+library(plotly)
+library(readxl)
+library(performance)
+library(broom) 
+library(report) 
+library(ggplot2)
+library(yfR)
+library(purrr)
+library(stargazer)
+library(reshape2)
+library(scales)
+library(zoo)
+
+##### Motivação da Análise por Comparação dos Ativos BOVA11 E DIVO11 #####
+ativos <- c("BOVA11.SA", "DIVO11.SA")
+preços <- getSymbols(ativos,
+                     from="2010-01-01", to="2022-11-24", verbose= FALSE, auto.assign= TRUE) %>% 
+  map(~Ad(get(.))) %>%
+  reduce(merge) %>%
+  `colnames<-`(ativos)
+plot(preços, legend.loc = "topleft")
+
+##### Buscar acoes do Ibovespa e Dividendos ####
+get_data_per_year <- function(start_year, end_year) {
+  
+  # Criar um dataframe vazio para armazenar os dados das ações coletadas
+  all_data <- data.frame()
+  
+  # Loop sobre cada ano entre o ano de início e o ano de fim
+  for (year in start_year:end_year) {
+    
+    # Converter o ano para o formato de data que a função yf_collection_get requer
+    first_date <- paste0(year, "-01-01")
+    last_date <- paste0(year, "-12-31")
+    
+    # Coletar os dados do índice IBOV para esse ano
+    yearly_data <- yf_collection_get("IBOV", first_date = first_date, 
+                                     last_date = last_date, freq_data = 'daily')
+    
+    # Retirar os NA's
+    yearly_data <- na.omit(yearly_data)
+    
+    # Adicionar os dados desse ano ao dataframe de todos os dados
+    all_data <- rbind(all_data, yearly_data)
+  }
+  
+  # Retornar o dataframe de todos os dados coletados
+  return(all_data)
+}
+
+# Usar a função para coletar dados de 2010 a 2023
+dados_acoes <- get_data_per_year(2010, 2023)
+
+# Verificando os símbolos das ações coletadas
+stock_symbols <- unique(dados_acoes$ticker)
+
+# remover colunas desnecessárias
+dados_acoes <- dados_acoes %>% select(ticker, ref_date, price_close, price_adjusted, 
+                                      ret_adjusted_prices, ret_closing_prices, 
+                                      cumret_adjusted_prices)
+
+# Organizar o dataframe de acordo com a descrição
+dados_acoes <- dados_acoes %>%
+  arrange(ticker, ref_date)
+
+#eliminar ações de empresas que tem dois papéis diferentes em circulação
+dados_acoes <- dados_acoes %>%
+  filter(!(ticker %in% c("BBDC3.SA", "PETR3.SA", "ELET6.SA")))
+
+####### dividendos 
+# função para obter dividendos
+get_dividends <- function(symbol) {
+  dividends <- tryCatch(
+    {
+      # tentar obter os dividendos
+      yf_get_dividends(symbol,first_date = "2010-01-01",
+                       last_date = "2023-07-03")
+    },
+    error = function(e) {
+      # se houver um erro, retorne NULL
+      return(NULL)
+    }
+  )
+  
+  # se os dividendos forem NULL, retorne NULL
+  if (is.null(dividends)) {
+    return(NULL)
+  }
+  
+# adicione uma coluna com o símbolo da ação
+  dividends <- dividends %>%
+    
+    return(dividends)
+}
+
+# aplicar a função a cada símbolo de ação
+dividends_list <- map(stock_symbols, get_dividends)
+
+# remover elementos NULL
+dividends_list <- dividends_list[!sapply(dividends_list, is.null)]
+
+# combinar todos os dataframes em um único dataframe
+all_dividends <- bind_rows(dividends_list)
+
+### Reportar as concentrações setoriais ####
+conc_setoriais_ibov <- read_excel("C:/Users/magal/Documents/Renan/PIBIC/IBOVDia_08-08-23 (1).xls")
+conc_setoriais_ibov <- na.omit(conc_setoriais_ibov)
+
+dados_acoes <- dados_acoes %>%
+  left_join(select(conc_setoriais_ibov, Setor, Código), by = c("ticker" = "Código"))
+
+dados_acoes <- dados_acoes %>%
+  mutate(Setor = case_when(
+    ticker == "AMER3.SA" ~ "Consumo Cíclico / Comércio",
+    ticker == "BPAN4.SA" ~ "Financ e Outros / Interms Financs",
+    ticker == "ECOR3.SA" ~ "Bens Indls/Transporte",
+    ticker == "JHSF3.SA" ~ "Consumo Cíclico/Constr Civil",
+    ticker == "QUAL3.SA" ~ "Saúde/Comércio Distr.",
+    TRUE ~ Setor
+  ))
+
+# Contar o número de ações por setor
+setor_counts <- dados_acoes %>%
+  distinct(ticker, Setor) %>% # Remover duplicatas
+  group_by(Setor) %>%
+  summarise(n = n()) %>%
+  arrange(-n)
+
+# Criar o gráfico de ações por setor
+ggplot(setor_counts, aes(x = reorder(Setor, n), y = n)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Concentração Setorial das Ações",
+       x = "Setor",
+       y = "Número de Ações") +
+  theme_minimal()
+
+### Fator maiores pagadores de dividendos ####
+
+# Ordenar o dataframe por ticker e ref_date
+all_dividends <- all_dividends %>% arrange(ticker, ref_date)
+
+# Criar a nova coluna com o total de proventos por ação e data
+all_dividends <- all_dividends %>%
+  group_by(ticker) %>%
+  mutate(total_dividends = cumsum(dividend))
+
+# Realizar o left join dos dataframes
+dados_acoes <- left_join(dados_acoes, all_dividends, by = c("ticker", "ref_date"))
+
+# Preencher valores NA (datas sem distribuição de dividendos) com 0 em dividend
+dados_acoes$dividend <- ifelse(is.na(dados_acoes$dividend), 0, dados_acoes$dividend)
+
+# Preencher valores NA (datas sem distribuição de dividendos) com 0 em total_dividends
+dados_acoes$total_dividends <- ifelse(is.na(dados_acoes$total_dividends), 0, dados_acoes$total_dividends)
+
+# Calcular o total cumulativo de proventos distribuídos por cada ação
+dados_acoes <- dados_acoes %>%
+  group_by(ticker) %>%
+  mutate(total_dividends = cumsum(dividend))
+
+# Preencher valores NA em total_dividends com o último valor não zero encontrado para cada ticker
+dados_acoes <- dados_acoes %>%
+  group_by(ticker) %>%
+  fill(total_dividends)
+
+# nova coluna com o total de dividendos em cada ano 
+dados_acoes <- dados_acoes %>%
+  mutate(ano = year(ref_date)) %>%
+  group_by(ticker, ano) %>%
+  mutate(total_dividend_ano = sum(dividend, na.rm = TRUE)) %>%
+  ungroup()
+
+### Calcular o tercil das ações com base no total de dividendos por ano
+dados_acoes <- dados_acoes %>%
+  group_by(ano) %>%
+  mutate(tercil_dividendos = ntile(total_dividend_ano, 3)) %>%
+  ungroup()
+
+# Organizar o dataframe de acordo com a descrição
+dados_acoes <- dados_acoes %>%
+  arrange(ticker, ref_date)
+
+# Calcular o retorno médio para cada tercil em cada data
+average_returns <- dados_acoes %>%
+  group_by(ref_date, tercil_dividendos) %>%
+  summarise(average_return = mean(ret_adjusted_prices, na.rm = TRUE))
+
+# Dividir o dataframe de retornos médios em dois: um para o tercil 1 e outro para o tercil 3
+returns_tercil1 <- subset(average_returns, tercil_dividendos == 1)
+returns_tercil3 <- subset(average_returns, tercil_dividendos == 3)
+
+# Fazer um full join dos dataframes com base na data
+returns_all <- merge(returns_tercil1, returns_tercil3, by="ref_date", all=TRUE)
+
+# Calcular o Fator Dividendos para cada data
+Fator_Dividendos <- returns_all$average_return.y - returns_all$average_return.x
+names(Fator_Dividendos) <- returns_all$ref_date
+
+# Criar dataframe com Fator Dividendos
+Fator_Dividendos_df <- data.frame(
+  ref_date = as.Date(names(Fator_Dividendos)),
+  retornos = Fator_Dividendos
+)
+
+## Maior Dividendo
+Index_Dividends = matrix(0, nrow(Fator_Dividendos_df), 1)
+Index_Dividends[1] = 1
+
+for (i in 2:nrow(Fator_Dividendos_df)){
+  Index_Dividends[i] = Index_Dividends[i-1]*(1+Fator_Dividendos_df$retornos[i-1])
+}
+
+# Adicionar a coluna V1 da matriz Index_Dividends ao dataframe Fator_Dividendos_df
+Fator_Dividendos_df$V1 <- Index_Dividends[, 1]
+
+# Retono de cada tercil para cada fator
+# Calcular retornos acumulados para cada tercil
+returns_tercil1$acumulado <- cumprod(1 + returns_tercil1$average_return) - 1
+returns_tercil2 <- aggregate(ret_adjusted_prices ~ ref_date + tercil_dividendos, data = subset(dados_acoes, tercil_dividendos == "2"), FUN = mean)
+returns_tercil2$acumulado <- cumprod(1 + returns_tercil2$ret_adjusted_prices) - 1
+returns_tercil3$acumulado <- cumprod(1 + returns_tercil3$average_return) - 1
+
+# Gráfico para o Fator Dividendos
+fig1 <- plot_ly() %>%
+  add_trace(x = ~returns_tercil1$ref_date, y = ~returns_tercil1$acumulado, type = 'scatter', mode = 'lines', name = 'Tercil 1') %>%
+  add_trace(x = ~returns_tercil2$ref_date, y = ~returns_tercil2$acumulado, type = 'scatter', mode = 'lines', name = 'Tercil 2') %>%
+  add_trace(x = ~returns_tercil3$ref_date, y = ~returns_tercil3$acumulado, type = 'scatter', mode = 'lines', name = 'Tercil 3') %>%
+  layout(title = "Retorno acumulado dos tercis para o Fator Dividendos",
+         xaxis = list(title = "Data"),
+         yaxis = list(title = "Retorno acumulado"))
+
+# Exibir o gráfico
+fig1
+
+# Gráfico do Retorno Acumulado do Fator Dividendos
+plot_ly(data = Fator_Dividendos_df, x = ~ref_date, y = ~V1, type = 'scatter', mode = 'lines') %>%
+  layout(title = "Retorno Acumulado do Fator Dividendos ao Longo do Tempo",
+         xaxis = list(title = "Data"),
+         yaxis = list(title = "Retorno Acumulado"))
+
+ggplot(data = Fator_Dividendos_df, aes(x = ref_date, y = V1)) +
+  geom_line() +
+  labs(title = "Retorno Acumulado do Fator Dividendos ao Longo do Tempo",
+       x = "Data",
+       y = "Retorno Acumulado") +
+  theme_minimal()
+
+###fator dividend yield ####
+#Dividend Yield da Bolsa
+Dividend_Yield<-read_excel("C:/Users/magal/Documents/Renan/PIBIC/dividend_yield.xls")
+Dividend_Yield <- Dividend_Yield %>%
+  mutate(Date = as.Date(paste(year, month, day, sep = "-")))
+
+DY <- plot_ly(Dividend_Yield, x = ~Date, y = ~yield_week_pc, type = 'scatter', mode = 'lines') 
+DY <- DY %>% layout(title = "DY Acumulado",
+                     xaxis = list(title = "Data"),
+                     yaxis = list(title = "Retorno Acumulado", tickformat = "%"))
+
+DY
+
+# Calcular o dividend yield para cada ação
+dados_acoes <- dados_acoes %>%
+  arrange(ticker, ref_date) %>%
+  group_by(ticker, ano) %>%
+  mutate(last_price_close = last(price_close)) %>%
+  ungroup() %>%
+  mutate(dividend_yield_ano = total_dividend_ano / last_price_close)
+
+### Calcular o tercil das ações com base no dividend yield por ano
+dados_acoes <- dados_acoes %>%
+  group_by(ano) %>%
+  mutate(tercil_dy = ntile(dividend_yield_ano, 3)) %>%
+  ungroup()
+
+# Calcular o retorno médio para cada tercil e data
+returns_tercil1_dy <- dados_acoes %>%
+  filter(tercil_dy == "1") %>%
+  group_by(ref_date) %>%
+  summarise(average_return = mean(ret_adjusted_prices, na.rm = TRUE))
+
+returns_tercil3_dy <- dados_acoes %>%
+  filter(tercil_dy == "3") %>%
+  group_by(ref_date) %>%
+  summarise(average_return = mean(ret_adjusted_prices, na.rm = TRUE))
+
+# Calcular o Fator Dividend Yield para cada data
+Fator_Dividend_Yield <- returns_tercil3_dy$average_return - returns_tercil1_dy$average_return
+names(Fator_Dividend_Yield) <- returns_tercil1_dy$ref_date
+
+# Criar o dataframe para o Fator Dividend Yield
+Fator_Dividend_Yield_df <- data.frame(
+  ref_date = as.Date(names(Fator_Dividend_Yield)),
+  retornos = Fator_Dividend_Yield
+)
+
+## Maior Dividendo
+Index_Dividend_Yield = matrix(0, nrow(Fator_Dividend_Yield_df), 1)
+Index_Dividend_Yield[1] = 1
+
+for (i in 2:nrow(Fator_Dividend_Yield_df)){
+  Index_Dividend_Yield[i] = Index_Dividend_Yield[i-1]*(1+Fator_Dividend_Yield_df$retornos[i-1])
+}
+
+# Adicionar a coluna V1 da matriz Index_Dividends ao dataframe Fator_Dividendos_df
+Fator_Dividend_Yield_df$V1 <- Index_Dividend_Yield[, 1]
+
+# retorno acumulado 
+Fator_Dividend_Yield_df$accumulated_return <- cumprod(1 + Fator_Dividend_Yield_df$retornos) - 1
+
+#criar o gráfico
+plot_ly(data = Fator_Dividend_Yield_df, x = ~ref_date, y = ~V1, type = 'scatter', mode = 'lines') %>%
+  layout(title = "Retorno Acumulado do Fator Dividendos ao Longo do Tempo",
+         xaxis = list(title = "Data"),
+         yaxis = list(title = "Retorno Acumulado"))
+
+
+# Retono de cada tercil para cada fator
+# Calcular retornos acumulados para cada tercil
+returns_tercil1_dy$acumulado <- cumprod(1 + returns_tercil1_dy$average_return) - 1
+returns_tercil2_dy <- aggregate(ret_adjusted_prices ~ ref_date + tercil_dy, data = subset(dados_acoes, tercil_dy == "2"), FUN = mean)
+returns_tercil2_dy$acumulado <- cumprod(1 + returns_tercil2_dy$ret_adjusted_prices) - 1
+returns_tercil3_dy$acumulado <- cumprod(1 + returns_tercil3_dy$average_return) - 1
+
+# Gráfico para o retorno acumulado de cada tercil do Fator Dividend Yield
+fig1 <- plot_ly() %>%
+  add_trace(x = ~returns_tercil1_dy$ref_date, y = ~returns_tercil1_dy$acumulado, type = 'scatter', mode = 'lines', name = 'Tercil 1') %>%
+  add_trace(x = ~returns_tercil2_dy$ref_date, y = ~returns_tercil2_dy$acumulado, type = 'scatter', mode = 'lines', name = 'Tercil 2') %>%
+  add_trace(x = ~returns_tercil3_dy$ref_date, y = ~returns_tercil3_dy$acumulado, type = 'scatter', mode = 'lines', name = 'Tercil 3') %>%
+  layout(title = "Retorno acumulado dos tercis para o Fator Dividend Yield",
+         xaxis = list(title = "Data"),
+         yaxis = list(title = "Retorno acumulado"))
+
+# Exibir o gráfico
+fig1
+
+### analisar fatores do NEFIN #####
+
+### baixar dados dos fatores
+Market_Factor <- read_excel("C:/Users/magal/Documents/Renan/PIBIC/Market_Factor.xls")
+SMB_Factor <- read_excel("C:/Users/magal/Documents/Renan/PIBIC/SMB_Factor.xls")
+Risk_Free <- read_excel("C:/Users/magal/Documents/Renan/PIBIC/Risk_Free.xls")
+HML_Factor <- read_excel("C:/Users/magal/Documents/Renan/PIBIC/HML_Factor.xls")
+WML_Factor <- read_excel("C:/Users/magal/Documents/Renan/PIBIC/WML_Factor.xls")
+
+### Colocar todos os dataframes em uma lista
+dataframes <- list(Market_Factor, SMB_Factor, Risk_Free, HML_Factor, WML_Factor)
+
+### Usar a função reduce() junto com left_join() para combinar os dataframes
+risk_factors <- reduce(dataframes, function(x, y) left_join(x, y, by = c("year", "month", "day")))
+
+### Visualizar o tibble resultante
+print(risk_factors)
+
+### Criar coluna com data completa
+risk_factors <- risk_factors %>%
+  mutate(Date = as.Date(paste(year, month, day, sep = "-")))
+
+# Criar coluna com apenas RM, que é o ibov
+risk_factors <- risk_factors %>%
+  mutate(IBOV = Rm_minus_Rf + Risk_free)
+
+### Cotizar fatores: Normaliza primeira data = 1 e gera retornos como cota para cada fator
+Index_Market_Return = matrix(0, nrow(risk_factors), 1)
+Index_Market_Return[1] = 1
+
+for (i in 2:nrow(risk_factors)) {
+  Index_Market_Return[i] = Index_Market_Return[i-1]*(1+risk_factors$Rm_minus_Rf[i-1])
+}
+
+##Tamanho
+Index_Size = matrix(0, nrow(risk_factors), 1)
+Index_Size[1] = 1
+
+for (i in 2:nrow(risk_factors)){
+  Index_Size[i] = Index_Size[i-1]*(1+risk_factors$SMB[i-1])
+}
+
+## Valor
+Index_Value = matrix(0, nrow(risk_factors), 1)
+Index_Value[1] = 1
+
+for (i in 2:nrow(risk_factors)){
+  Index_Value[i] = Index_Value[i-1]*(1+risk_factors$HML[i-1])
+}
+
+## Momentum
+Index_Momentum = matrix(0, nrow(risk_factors), 1)
+Index_Momentum[1] = 1
+
+for (i in 2:nrow(risk_factors)){
+  Index_Momentum[i] = Index_Momentum[i-1]*(1+risk_factors$WML[i-1])
+}
+
+#Criar novo dataframe
+Indexes = data.frame(risk_factors$Date, Index_Market_Return, Index_Momentum, 
+                     Index_Size, Index_Value)
+Indexes = Indexes %>% rename(data=risk_factors.Date, RM = Index_Market_Return,
+                             SMB = Index_Size, HML = Index_Value, WML = Index_Momentum)
+
+# Gráfico dos desempenhos dos fatores do NEFIN
+grafico_1 = reshape2::melt(Indexes, id.vars = "data")
+names(grafico_1)[names(grafico_1) == "variavel"] <- "factor"
+grafico_1$data <- as.Date(grafico_1$data, format = "%y/%m/%d", origin = as.Date("2001-01-02"))
+
+pl <-ggplot(grafico_1, aes(x= data, y= value, col=variable, linetype=variable)) + 
+  geom_line() +
+  ylab("Index")+labs(x="Date")+
+  scale_linetype_manual(values=c("solid", "solid", "solid", "solid"))+
+  scale_color_manual(values = c("green","blue","black","red")) +
+  geom_hline(aes(yintercept=0.0), colour="red", linetype="dashed") +
+  scale_x_date(breaks = seq(as.Date("2015-02-02"), as.Date("2022-12-01"), by = "2 year"), labels=date_format("%Y-%m")) +
+  theme(axis.text.x = element_text(angle=10,hjust = 1)) +
+  theme(plot.margin = unit(c(-0,1,0,0), "cm")) + 
+  ggtitle("Retornos dos Portifólios de Fatores")
+ppl <- ggplotly(pl, tooltip= c("data", "value"))
+ppl
+
+### Estatísticas Descritivas acerca das carteiras formadas e os benchmarks. ####
+
+# Filtrar dados a partir de "2010-01-05"
+risk_factors_filtered <- risk_factors %>%
+  filter(Date >= "2010-01-05")
+
+# Calcula as estatísticas descritivas
+stats <- risk_factors_filtered %>%
+  summarise_at(vars(IBOV, Risk_free),
+               list(
+                 mean = ~mean(.),
+                 median = ~median(.),
+                 sd = ~sd(.),
+                 min = ~min(.),
+                 max = ~max(.)
+               ))
+
+# Calcula o índice Sharpe
+sharpe <- map_dbl(c("IBOV", "Risk_free"), 
+                  ~mean(risk_factors_filtered[[.]] - risk_factors_filtered$Risk_free) / 
+                    sd(risk_factors_filtered[[.]] - risk_factors_filtered$Risk_free))
+
+# Calcula o índice Sortino
+sortino <- map_dbl(c("IBOV", "Risk_free"), 
+                   ~mean(risk_factors_filtered[[.]] - risk_factors_filtered$Risk_free) / 
+                     sqrt(mean(pmin(risk_factors_filtered[[.]] - risk_factors_filtered$Risk_free, 0)^2)))
+
+# Combina os resultados na tabela final
+final_stats <- bind_cols(stats, 
+                         sharpe = sharpe,
+                         sortino = sortino)
+
+print(final_stats)
+
+#Fator Dividendos
+
+# O Próprio
+
+# Calcula as estatísticas descritivas
+stats_F_Dividendos <- Fator_Dividendos_df %>%
+  ungroup() %>%
+  filter(ref_date >= "2010-01-05") %>%
+  summarise(
+    mean = mean(retornos, na.rm = TRUE),
+    median = median(retornos, na.rm = TRUE),
+    sd = sd(retornos, na.rm = TRUE),
+    min = min(retornos, na.rm = TRUE),
+    max = max(retornos, na.rm = TRUE)
+  )
+
+# Unir a coluna Risk_free ao dataframe returns_tercil1_filtered
+Fator_Dividendos_df <- Fator_Dividendos_df %>%
+  filter(ref_date >= "2010-01-05") %>%
+  left_join(risk_factors %>% select(Date, Risk_free), by = c("ref_date" = "Date"))
+
+# Calcular os excess returns
+Fator_Dividendos_df$excess_return <- Fator_Dividendos_df$retornos - Fator_Dividendos_df$Risk_free
+
+# Calcular o Índice Sharpe
+sharpe <- mean(Fator_Dividendos_df$excess_return, na.rm = TRUE) / 
+  sd(Fator_Dividendos_df$excess_return, na.rm = TRUE)
+
+# Calcular o Sortino
+negative_returns <- Fator_Dividendos_df$excess_return[Fator_Dividendos_df$excess_return < 0]
+downside_risk <- sqrt(mean(negative_returns^2, na.rm = TRUE))
+sortino <- mean(Fator_Dividendos_df$excess_return, na.rm = TRUE) / downside_risk
+
+# Criar dataframe com os resultados e depois combina
+results <- data.frame(Sharpe = sharpe, Sortino = sortino)
+print(results)
+
+combined_stats <- dplyr::bind_cols(stats_F_Dividendos, results, .fill = TRUE)
+print(combined_stats)
+
+# tercil 1
+
+# Calcula as estatísticas descritivas
+stats_F_Dividendos_1 <- returns_tercil1 %>%
+  ungroup() %>%
+  filter(ref_date >= "2010-01-05") %>%
+  summarise(
+    mean = mean(average_return, na.rm = TRUE),
+    median = median(average_return, na.rm = TRUE),
+    sd = sd(average_return, na.rm = TRUE),
+    min = min(average_return, na.rm = TRUE),
+    max = max(average_return, na.rm = TRUE)
+  )
+
+# Unir a coluna Risk_free ao dataframe returns_tercil1
+returns_tercil1 <- returns_tercil1 %>%
+  filter(ref_date >= "2010-01-05") %>%
+  left_join(risk_factors %>% select(Date, Risk_free), by = c("ref_date" = "Date"))
+
+# Calcular os excess returns
+returns_tercil1$excess_return <- returns_tercil1$average_return - returns_tercil1$Risk_free
+
+# Calcular o Índice Sharpe
+sharpe <- mean(returns_tercil1$excess_return, na.rm = TRUE) / 
+  sd(returns_tercil1$excess_return, na.rm = TRUE)
+
+# Calcular o Sortino
+negative_returns <- returns_tercil1$excess_return[returns_tercil1$excess_return < 0]
+downside_risk <- sqrt(mean(negative_returns^2, na.rm = TRUE))
+sortino <- mean(returns_tercil1$excess_return, na.rm = TRUE) / downside_risk
+
+# Criar dataframe com os resultados e depois combina
+results_1 <- data.frame(Sharpe = sharpe, Sortino = sortino)
+print(results_1)
+
+combined_stats_1 <- dplyr::bind_cols(stats_F_Dividendos_1, results, .fill = TRUE)
+print(combined_stats_1)
+
+#tercil 2
+
+# Calcula as estatísticas descritivas
+stats_F_Dividendos_2 <- returns_tercil2 %>%
+  ungroup() %>%
+  filter(ref_date >= "2010-01-05") %>%
+  summarise(
+    mean = mean(ret_adjusted_prices, na.rm = TRUE),
+    median = median(ret_adjusted_prices, na.rm = TRUE),
+    sd = sd(ret_adjusted_prices, na.rm = TRUE),
+    min = min(ret_adjusted_prices, na.rm = TRUE),
+    max = max(ret_adjusted_prices, na.rm = TRUE)
+  )
+
+# Unir a coluna Risk_free ao dataframe returns_tercil1_filtered
+returns_tercil2 <- returns_tercil2 %>%
+  filter(ref_date >= "2010-01-05") %>%
+  left_join(risk_factors %>% select(Date, Risk_free), by = c("ref_date" = "Date"))
+
+# Calcular os excess returns
+returns_tercil2$excess_return <- returns_tercil2$ret_adjusted_prices - returns_tercil2$Risk_free
+
+# Calcular o Índice Sharpe
+sharpe <- mean(returns_tercil2$excess_return, na.rm = TRUE) / 
+  sd(returns_tercil2$excess_return, na.rm = TRUE)
+
+# Calcular o Sortino
+negative_returns <- returns_tercil2$excess_return[returns_tercil2$excess_return < 0]
+downside_risk <- sqrt(mean(negative_returns^2, na.rm = TRUE))
+sortino <- mean(returns_tercil2$excess_return, na.rm = TRUE) / downside_risk
+
+# Criar dataframe com os resultados e depois combina
+results_2 <- data.frame(Sharpe = sharpe, Sortino = sortino)
+print(results_2)
+
+combined_stats_2 <- dplyr::bind_cols(stats_F_Dividendos_2, results_2, .fill = TRUE)
+print(combined_stats_2)
+
+
+#tercil 3 
+
+# Calcula as estatísticas descritivas
+stats_F_Dividendos_3 <- returns_tercil3 %>%
+  ungroup() %>%
+  filter(ref_date >= "2010-01-05") %>%
+  summarise(
+    mean = mean(average_return, na.rm = TRUE),
+    median = median(average_return, na.rm = TRUE),
+    sd = sd(average_return, na.rm = TRUE),
+    min = min(average_return, na.rm = TRUE),
+    max = max(average_return, na.rm = TRUE)
+  )
+
+# Unir a coluna Risk_free ao dataframe returns_tercil1_filtered
+returns_tercil3 <- returns_tercil3 %>%
+  filter(ref_date >= "2010-01-05") %>%
+  left_join(risk_factors %>% select(Date, Risk_free), by = c("ref_date" = "Date"))
+
+# Calcular os excess returns
+returns_tercil3$excess_return <- returns_tercil3$average_return - returns_tercil3$Risk_free
+
+# Calcular o Índice Sharpe
+sharpe <- mean(returns_tercil3$excess_return, na.rm = TRUE) / 
+  sd(returns_tercil3$excess_return, na.rm = TRUE)
+
+# Calcular o Sortino
+negative_returns <- returns_tercil3$excess_return[returns_tercil3$excess_return < 0]
+downside_risk <- sqrt(mean(negative_returns^2, na.rm = TRUE))
+sortino <- mean(returns_tercil3$excess_return, na.rm = TRUE) / downside_risk
+
+# Criar dataframe com os resultados e depois combina
+results_3 <- data.frame(Sharpe = sharpe, Sortino = sortino)
+print(results_3)
+
+combined_stats_3 <- dplyr::bind_cols(stats_F_Dividendos_3, results_3, .fill = TRUE)
+print(combined_stats_3)
+
+#Fator Dividend Yield
+
+# O Próprio
+
+# Calcula as estatísticas descritivas
+stats_F_DY <- Fator_Dividend_Yield_df %>%
+  ungroup() %>%
+  filter(ref_date >= "2010-01-05") %>%
+  summarise(
+    mean = mean(retornos, na.rm = TRUE),
+    median = median(retornos, na.rm = TRUE),
+    sd = sd(retornos, na.rm = TRUE),
+    min = min(retornos, na.rm = TRUE),
+    max = max(retornos, na.rm = TRUE)
+  )
+
+# Unir a coluna Risk_free ao dataframe returns_tercil1_filtered
+Fator_Dividend_Yield_df <- Fator_Dividend_Yield_df %>%
+  filter(ref_date >= "2010-01-05") %>%
+  left_join(risk_factors %>% select(Date, Risk_free), by = c("ref_date" = "Date"))
+
+# Calcular os excess returns
+Fator_Dividend_Yield_df$excess_return <- Fator_Dividend_Yield_df$retornos - Fator_Dividend_Yield_df$Risk_free
+
+# Calcular o Índice Sharpe
+sharpe <- mean(Fator_Dividend_Yield_df$excess_return, na.rm = TRUE) / 
+  sd(Fator_Dividend_Yield_df$excess_return, na.rm = TRUE)
+
+# Calcular o Sortino
+negative_returns <- Fator_Dividend_Yield_df$excess_return[Fator_Dividend_Yield_df$excess_return < 0]
+downside_risk <- sqrt(mean(negative_returns^2, na.rm = TRUE))
+sortino <- mean(Fator_Dividend_Yield_df$excess_return, na.rm = TRUE) / downside_risk
+
+# Criar dataframe com os resultados e depois combina
+results_dy <- data.frame(Sharpe = sharpe, Sortino = sortino)
+print(results_dy)
+
+combined_stats_dy <- dplyr::bind_cols(stats_F_DY, results_dy, .fill = TRUE)
+print(combined_stats_dy)
+
+#tercil 1
+# Filtrar dados a partir de "2010-01-05" e remover NAs
+returns_tercil1_filtered <- returns_tercil1_dy %>%
+  filter(ref_date >= "2010-01-05" & !is.na(average_return))
+
+
+# Calcula as estatísticas descritivas
+stats_F_DY_1 <- returns_tercil1_dy %>%
+  ungroup() %>%
+  filter(ref_date >= "2010-01-05") %>%
+  summarise(
+    mean = mean(average_return, na.rm = TRUE),
+    median = median(average_return, na.rm = TRUE),
+    sd = sd(average_return, na.rm = TRUE),
+    min = min(average_return, na.rm = TRUE),
+    max = max(average_return, na.rm = TRUE)
+  )
+
+# Unir a coluna Risk_free ao dataframe returns_tercil1_dy
+returns_tercil1_dy <- returns_tercil1_dy %>%
+  filter(ref_date >= "2010-01-05") %>%
+  left_join(risk_factors %>% select(Date, Risk_free), by = c("ref_date" = "Date"))
+
+# Calcular os excess returns
+returns_tercil1_dy$excess_return <- returns_tercil1_dy$average_return - returns_tercil1_dy$Risk_free
+
+# Calcular o Índice Sharpe
+sharpe <- mean(returns_tercil1_dy$excess_return, na.rm = TRUE) / 
+  sd(returns_tercil1_dy$excess_return, na.rm = TRUE)
+
+# Calcular o Sortino
+negative_returns <- returns_tercil1_dy$excess_return[returns_tercil1_dy$excess_return < 0]
+downside_risk <- sqrt(mean(negative_returns^2, na.rm = TRUE))
+sortino <- mean(returns_tercil1_dy$excess_return, na.rm = TRUE) / downside_risk
+
+# Criar dataframe com os resultados e depois combina
+results_1_dy <- data.frame(Sharpe = sharpe, Sortino = sortino)
+print(results_1_dy)
+
+combined_stats_1_dy <- dplyr::bind_cols(stats_F_DY_1, results_1_dy, .fill = TRUE)
+print(combined_stats_1_dy)
+
+#tercil 2
+# Calcula as estatísticas descritivas
+stats_F_DY_2 <- returns_tercil2_dy %>%
+  ungroup() %>%
+  filter(ref_date >= "2010-01-05") %>%
+  summarise(
+    mean = mean(ret_adjusted_prices, na.rm = TRUE),
+    median = median(ret_adjusted_prices, na.rm = TRUE),
+    sd = sd(ret_adjusted_prices, na.rm = TRUE),
+    min = min(ret_adjusted_prices, na.rm = TRUE),
+    max = max(ret_adjusted_prices, na.rm = TRUE)
+  )
+
+# Unir a coluna Risk_free ao dataframe returns_tercil1_filtered
+returns_tercil2_dy <- returns_tercil2_dy %>%
+  filter(ref_date >= "2010-01-05") %>%
+  left_join(risk_factors %>% select(Date, Risk_free), by = c("ref_date" = "Date"))
+
+# Calcular os excess returns
+returns_tercil2_dy$excess_return <- returns_tercil2_dy$ret_adjusted_prices - returns_tercil2_dy$Risk_free
+
+# Calcular o Índice Sharpe
+sharpe <- mean(returns_tercil2_dy$excess_return, na.rm = TRUE) / 
+  sd(returns_tercil2_dy$excess_return, na.rm = TRUE)
+
+# Calcular o Sortino
+negative_returns <- returns_tercil2_dy$excess_return[returns_tercil2_dy$excess_return < 0]
+downside_risk <- sqrt(mean(negative_returns^2, na.rm = TRUE))
+sortino <- mean(returns_tercil2_dy$excess_return, na.rm = TRUE) / downside_risk
+
+# Criar dataframe com os resultados e depois combina
+results_2_dy <- data.frame(Sharpe = sharpe, Sortino = sortino)
+print(results_2_dy)
+
+combined_stats_2_dy <- dplyr::bind_cols(stats_F_DY_2, results_2_dy, .fill = TRUE)
+print(combined_stats_2_dy)
+
+
+#tercil 3 
+
+# Calcula as estatísticas descritivas
+stats_F_DY_3 <- returns_tercil3_dy %>%
+  ungroup() %>%
+  filter(ref_date >= "2010-01-05") %>%
+  summarise(
+    mean = mean(average_return, na.rm = TRUE),
+    median = median(average_return, na.rm = TRUE),
+    sd = sd(average_return, na.rm = TRUE),
+    min = min(average_return, na.rm = TRUE),
+    max = max(average_return, na.rm = TRUE)
+  )
+
+# Unir a coluna Risk_free ao dataframe returns_tercil1_filtered
+returns_tercil3_dy <- returns_tercil3_dy %>%
+  filter(ref_date >= "2010-01-05") %>%
+  left_join(risk_factors %>% select(Date, Risk_free), by = c("ref_date" = "Date"))
+
+# Calcular os excess returns
+returns_tercil3_dy$excess_return <- returns_tercil3_dy$average_return - returns_tercil3_dy$Risk_free
+
+# Calcular o Índice Sharpe
+sharpe <- mean(returns_tercil3_dy$excess_return, na.rm = TRUE) / 
+  sd(returns_tercil3_dy$excess_return, na.rm = TRUE)
+
+# Calcular o Sortino
+negative_returns <- returns_tercil3_dy$excess_return[returns_tercil3_dy$excess_return < 0]
+downside_risk <- sqrt(mean(negative_returns^2, na.rm = TRUE))
+sortino <- mean(returns_tercil3_dy$excess_return, na.rm = TRUE) / downside_risk
+
+# Criar dataframe com os resultados e depois combina
+results_3_dy <- data.frame(Sharpe = sharpe, Sortino = sortino)
+print(results_3_dy)
+
+combined_stats_3_dy <- dplyr::bind_cols(stats_F_DY_3, results_3_dy, .fill = TRUE)
+print(combined_stats_3_dy)
+
+### Regressões ####
+
+### Regressando tercis 1 e 3 do Fator Dividendos e o próprio fator com o modelo Carhart 
+
+#Tercil 1
+
+# Excessos de retornos - Cada carteira menos o IBOV. 
+returns_tercil1 <- returns_tercil1 %>%
+  filter(ref_date >= "2010-01-05") %>%
+  left_join(risk_factors %>% select(Date, IBOV, Rm_minus_Rf, SMB, HML, WML), by = c("ref_date" = "Date"))
+
+returns_tercil1$excess_return <- returns_tercil1$average_return - returns_tercil1$IBOV
+
+retorno_excessivo_medio <- mean(returns_tercil1$excess_return, na.rm = TRUE)
+retorno_excessivo_medio
+
+# Alfas Relativos ao IBOV
+# Calcular o intercepto das regressões lineares por mqo, da data de início até a data final.
+
+# Cria o modelo de regressão linear
+modelo_carhart <- lm(average_return ~ Rm_minus_Rf + SMB + HML + WML, data = returns_tercil1)
+
+# Ver resumo da regressão
+summary(modelo_carhart)
+
+# Para obter apenas o alpha (intercepto)
+alpha <- coef(modelo_carhart)[1]
+print(alpha)
+
+# Tercil 3
+
+# Excessos de retornos - Cada carteira menos o IBOV. 
+returns_tercil3 <- returns_tercil3 %>%
+  filter(ref_date >= "2010-01-05") %>%
+  left_join(risk_factors %>% select(Date, IBOV, Rm_minus_Rf, SMB, HML, WML), by = c("ref_date" = "Date"))
+
+returns_tercil3$excess_return <- returns_tercil3$average_return - returns_tercil3$IBOV
+
+retorno_excessivo_medio <- mean(returns_tercil3$excess_return, na.rm = TRUE)
+retorno_excessivo_medio
+
+# Alfas Relativos ao IBOV
+# Calcular o intercepto das regressões lineares por mqo, da data de início até a data final.
+
+# Cria o modelo de regressão linear
+modelo_carhart <- lm(average_return ~ Rm_minus_Rf + SMB + HML + WML, data = returns_tercil3)
+
+# Ver resumo da regressão
+summary(modelo_carhart)
+
+# obtendo apenas o alpha (intercepto)
+alpha <- coef(modelo_carhart)[1]
+print(alpha)
+
+# Fator Dividendos
+
+# Excessos de retornos - Cada carteira menos o IBOV.
+
+Fator_Dividendos_df <- Fator_Dividendos_df %>%
+  filter(ref_date >= "2010-01-05") %>%
+  left_join(risk_factors %>% select(Date, IBOV, Rm_minus_Rf, SMB, HML, WML), by = c("ref_date" = "Date"))
+
+Fator_Dividendos_df$excess_return <- Fator_Dividendos_df$retornos - Fator_Dividendos_df$IBOV
+
+retorno_excessivo_medio <- mean(Fator_Dividendos_df$excess_return, na.rm = TRUE)
+retorno_excessivo_medio
+
+# Alfas Relativos ao IBOV
+# Calcular o intercepto das regressões lineares por mqo, da data de início até a data final.
+
+# Cria o modelo de regressão linear
+modelo_carhart <- lm(retornos ~ Rm_minus_Rf + SMB + HML + WML, data = Fator_Dividendos_df)
+
+# Ver resumo da regressão
+summary(modelo_carhart)
+
+# obtendo apenas o alpha (intercepto)
+alpha <- coef(modelo_carhart)[1]
+print(alpha)
+
+### Regressando tercis 1 e 3 do Fator Dividend Yield e o próprio fator com o modelo Carhart
+
+# Tercil 1
+
+# Excessos de retornos - Cada carteira menos o IBOV.
+
+returns_tercil1_dy <- returns_tercil1_dy %>%
+  filter(ref_date >= "2010-01-05") %>%
+  left_join(risk_factors %>% select(Date, IBOV, Rm_minus_Rf, SMB, HML, WML), by = c("ref_date" = "Date"))
+
+returns_tercil1_dy$excess_return <- returns_tercil1_dy$average_return - returns_tercil1_dy$IBOV
+
+retorno_excessivo_medio <- mean(returns_tercil1_dy$excess_return, na.rm = TRUE)
+retorno_excessivo_medio
+
+# Alfas Relativos ao IBOV
+# Calcular o intercepto das regressões lineares por mqo, da data de início até a data final.
+
+# Cria o modelo de regressão linear
+modelo_carhart <- lm(average_return ~ Rm_minus_Rf + SMB + HML + WML, data = returns_tercil1_dy)
+
+# Ver resumo da regressão
+summary(modelo_carhart)
+
+# obtendo apenas o alpha (intercepto)
+alpha <- coef(modelo_carhart)[1]
+print(alpha)
+
+# Tercil 3
+
+# Excessos de retornos - Cada carteira menos o IBOV.
+
+returns_tercil3_dy <- returns_tercil3_dy %>%
+  filter(ref_date >= "2010-01-05") %>%
+  left_join(risk_factors %>% select(Date, IBOV, Rm_minus_Rf, SMB, HML, WML), by = c("ref_date" = "Date"))
+
+returns_tercil3_dy$excess_return <- returns_tercil3_dy$average_return - returns_tercil3_dy$IBOV
+
+retorno_excessivo_medio <- mean(returns_tercil3_dy$excess_return, na.rm = TRUE)
+retorno_excessivo_medio
+
+# Alfas Relativos ao IBOV
+# Calcular o intercepto das regressões lineares por mqo, da data de início até a data final.
+
+# Cria o modelo de regressão linear
+modelo_carhart <- lm(average_return ~ Rm_minus_Rf + SMB + HML + WML, data = returns_tercil3_dy)
+
+# Ver resumo da regressão
+summary(modelo_carhart)
+
+# obtendo apenas o alpha (intercepto)
+alpha <- coef(modelo_carhart)[1]
+print(alpha)
+
+# Fator Dividend Yield
+
+# Excessos de retornos
+# 1. Cada carteira menos o IBOV. 
+Fator_Dividend_Yield_df <- Fator_Dividend_Yield_df %>%
+  filter(ref_date >= "2010-01-05") %>%
+  left_join(risk_factors %>% select(Date, IBOV, Rm_minus_Rf, SMB, HML, WML), by = c("ref_date" = "Date"))
+
+Fator_Dividend_Yield_df$excess_return <- Fator_Dividend_Yield_df$retornos - Fator_Dividend_Yield_df$IBOV
+
+retorno_excessivo_medio <- mean(Fator_Dividend_Yield_df$excess_return, na.rm = TRUE)
+retorno_excessivo_medio
+
+
+# Alfas Relativos ao IBOV
+# Calcular o intercepto das regressões lineares por mqo, da data de início até a data final.
+
+# Cria o modelo de regressão linear
+modelo_carhart <- lm(retornos ~ Rm_minus_Rf + SMB + HML + WML, data = Fator_Dividend_Yield_df)
+
+# Ver resumo da regressão
+summary(modelo_carhart)
+
+# obtendo apenas o alpha (intercepto)
+alpha <- coef(modelo_carhart)[1]
+print(alpha)
